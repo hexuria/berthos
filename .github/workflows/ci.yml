@@ -43,4 +43,14 @@ jobs:
             echo "expected bind-all to fail closed" >&2
             exit 1
           fi
-          "$bin" doctor --simulate laptop --json | grep -q '"eligible": false'
+          # Doctor exits 1 when ineligible (correct). Capture JSON separately so
+          # pipefail does not treat that exit as a CI failure.
+          set +e
+          "$bin" doctor --simulate laptop --json > /tmp/berthos-doctor.json
+          doctor_exit=$?
+          set -e
+          if [ "$doctor_exit" -eq 0 ]; then
+            echo "expected laptop --json to exit 1" >&2
+            exit 1
+          fi
+          grep -q '"eligible": false' /tmp/berthos-doctor.json
