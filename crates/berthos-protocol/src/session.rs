@@ -173,6 +173,10 @@ pub struct Lease {
     /// When the guest was destroyed, if ended.
     #[serde(with = "time::serde::rfc3339::option")]
     pub ended_at: Option<OffsetDateTime>,
+    /// Loopback-only guest view (noVNC or equivalent) for this live lease.
+    /// Absent after the lease ends. Never a bind-all URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_url: Option<String>,
 }
 
 /// Occupancy receipt. Seconds held, not clicks or agent actions.
@@ -260,6 +264,7 @@ mod tests {
             quote,
             started_at: started,
             ended_at: None,
+            viewer_url: None,
         };
         let ended = started + Duration::seconds(12);
         let receipt = Receipt::from_lease(&lease, ended, EndReason::Graceful);

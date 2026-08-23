@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 axum.workspace = true
 berthos-protocol = { path = "../berthos-protocol" }
+futures-util = "0.3"
 hex.workspace = true
 rand.workspace = true
 serde.workspace = true
@@ -26,3 +27,4 @@ uuid.workspace = true
 [dev-dependencies]
 http-body-util = "0.1"
 tower.workspace = true
+ureq = { version = "2.12", default-features = false, features = ["json"] }

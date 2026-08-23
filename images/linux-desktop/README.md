@@ -29,6 +29,14 @@ Do not add `--network host`, a default `iptables ACCEPT`, or a baked-in API key 
 
 Xvfb (`1280x800x24`) + openbox + Chromium, running as user `agent`. That is the leased desktop. It is not the operator's session.
 
+Also inside the guest (still isolated):
+
+- `x11vnc` on **guest** `127.0.0.1:5900` (the guest Xvfb only)
+- noVNC / websockify on **guest** `127.0.0.1:6080` (unreachable from the host LAN; `--network none`)
+- `/usr/local/bin/driver` → `action.sh` (screenshot / click / type / key via xdotool + ImageMagick `import` on `:99`)
+
+The node maps that display through a loopback viewer and `docker exec`. It does not bind the host display.
+
 ## What must never be in the image
 
 - Pairing tokens, `~/.berthos`, cloud keys, rclone configs

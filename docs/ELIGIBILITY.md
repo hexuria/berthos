@@ -153,6 +153,6 @@ On a machine with Docker:
 3. `berth doctor` — every required row `pass`, `tunnel` may `warn`. JSON has `ok: true` and the image labels.
 4. `berth node up` — prints a pairing code, listens on `127.0.0.1:7432`.
 5. `GET http://127.0.0.1:7432/v1/eligibility` matches the CLI report (same schema).
-6. `berth pair` then `berth up --os linux` — starts `docker run --network none`. `DELETE /v1/leases/{id}` destroys the container and returns occupancy seconds.
+6. `berth pair` then `berth up --os linux` — starts `docker run --network none`. `berth view` prints a loopback guest URL. `berth mcp` screenshots the guest. `DELETE /v1/leases/{id}` / `berth end` destroys the container, drops the view, and returns occupancy seconds.
 
 If step 3 is red, stop. Do not "just start the node anyway."

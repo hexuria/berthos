@@ -21,9 +21,11 @@ use time::OffsetDateTime;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
+use crate::action::{action_argv, argv_targets_host, parse_button, GuestOp, PNG_MAGIC};
 use crate::eligibility::evaluate;
 use crate::guest::{GuestError, GuestHandle, GuestRuntime, GuestSpec};
 use crate::pairing::{Capability, PairError, PairingBooth};
+use crate::view::LoopbackView;
 use crate::{NodeConfig, NodeError};
 
 /// Shared node process state.
@@ -51,6 +53,8 @@ pub struct LiveLease {
     pub lease: Lease,
     /// Runtime handle for destroy-on-end.
     pub handle: GuestHandle,
+    /// Loopback-only guest view. Dropped when the lease ends.
+    pub view: Option<LoopbackView>,
 }
 
 /// Shared state wrapper.
@@ -105,6 +109,9 @@ pub fn router(state: NodeState) -> Router {
         .route("/v1/pair", post(pair))
         .route("/v1/leases", post(create_lease).get(list_leases))
         .route("/v1/leases/{id}", delete(end_lease).get(get_lease))
+        .route("/v1/leases/{id}/screenshot", get(lease_screenshot))
+        .route("/v1/leases/{id}/actions", post(lease_action))
+        .route("/v1/leases/{id}/view", get(lease_view_info))
         .with_state(state)
 }
 
@@ -271,12 +278,50 @@ async fn create_lease(
         quote,
         started_at: OffsetDateTime::now_utc(),
         ended_at: None,
+        viewer_url: None,
     };
     inner.live = Some(LiveLease {
         lease: lease.clone(),
         handle,
+        view: None,
     });
-    Ok((StatusCode::CREATED, Json(lease)))
+    drop(inner);
+
+    let view = match LoopbackView::start(state.clone(), id.clone()).await {
+        Ok(view) => view,
+        Err(e) => {
+            let mut inner = state.lock().await;
+            if let Some(live) = inner.live.take() {
+                if live.lease.id == id {
+                    let _ = inner.guests.destroy(&live.handle);
+                } else {
+                    inner.live = Some(live);
+                }
+            }
+            return Err(ApiError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                e.to_string(),
+            ));
+        }
+    };
+
+    let mut inner = state.lock().await;
+    let Some(live) = inner.live.as_mut() else {
+        let mut view = view;
+        view.stop();
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "lease not found"));
+    };
+    if live.lease.id != id {
+        let mut view = view;
+        view.stop();
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "a lease is already live",
+        ));
+    }
+    live.lease.viewer_url = Some(view.url());
+    live.view = Some(view);
+    Ok((StatusCode::CREATED, Json(live.lease.clone())))
 }
 
 async fn list_leases(
@@ -321,6 +366,9 @@ async fn end_lease(
         inner.live = Some(live);
         return Err(ApiError::new(StatusCode::NOT_FOUND, "lease not found"));
     }
+    if let Some(mut view) = live.view {
+        view.stop();
+    }
     if let Err(e) = inner.guests.destroy(&live.handle) {
         tracing::warn!("guest destroy: {e}");
     }
@@ -343,13 +391,154 @@ fn require_token(inner: &NodeInner, headers: &HeaderMap, need: Capability) -> Re
     inner.pairing.authorize(token, need).map_err(ApiError::from)
 }
 
-struct ApiError {
+/// JSON body for `POST /v1/leases/{id}/actions`.
+#[derive(Debug, Deserialize)]
+struct ActionBody {
+    op: String,
+    x: Option<i32>,
+    y: Option<i32>,
+    button: Option<String>,
+    text: Option<String>,
+    keys: Option<Vec<String>>,
+}
+
+/// `GET /v1/leases/{id}/view` — pairing token + loopback URL for this lease.
+#[derive(Debug, Serialize)]
+struct ViewInfo {
+    viewer_url: String,
+    target: &'static str,
+    token: &'static str,
+}
+
+async fn lease_view_info(
+    State(state): State<NodeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<ViewInfo>, ApiError> {
+    let inner = state.lock().await;
+    require_token(&inner, &headers, Capability::Lease)?;
+    match inner.live.as_ref() {
+        Some(live) if live.lease.id.0 == id => {
+            let viewer_url =
+                live.lease.viewer_url.clone().ok_or_else(|| {
+                    ApiError::new(StatusCode::NOT_FOUND, "lease has no guest view")
+                })?;
+            Ok(Json(ViewInfo {
+                viewer_url,
+                target: "guest",
+                token: "Authorization: Bearer <lease token from POST /v1/pair>",
+            }))
+        }
+        _ => Err(ApiError::new(StatusCode::NOT_FOUND, "lease not found")),
+    }
+}
+
+async fn lease_screenshot(
+    State(state): State<NodeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let png = run_live_op(&state, &headers, &id, GuestOp::Screenshot).await?;
+    if !png.starts_with(PNG_MAGIC) {
+        return Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "guest screenshot was not a PNG",
+        ));
+    }
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(png))
+        .expect("response"))
+}
+
+async fn lease_action(
+    State(state): State<NodeState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<ActionBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let op = parse_action_body(&body)?;
+    let _ = run_live_op(&state, &headers, &id, op).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "target": "guest" })))
+}
+
+fn parse_action_body(body: &ActionBody) -> Result<GuestOp, ApiError> {
+    match body.op.as_str() {
+        "click" => {
+            let x = body
+                .x
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "x is required"))?;
+            let y = body
+                .y
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "y is required"))?;
+            let button = parse_button(body.button.as_deref())
+                .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+            Ok(GuestOp::Click { x, y, button })
+        }
+        "type" => {
+            let text = body
+                .text
+                .clone()
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "text is required"))?;
+            Ok(GuestOp::Type { text })
+        }
+        "key" => {
+            let keys = body
+                .keys
+                .clone()
+                .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "keys is required"))?;
+            Ok(GuestOp::Key { keys })
+        }
+        "screenshot" => Ok(GuestOp::Screenshot),
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("unknown op `{other}`"),
+        )),
+    }
+}
+
+async fn run_live_op(
+    state: &NodeState,
+    headers: &HeaderMap,
+    id: &str,
+    op: GuestOp,
+) -> Result<Vec<u8>, ApiError> {
+    let argv =
+        action_argv(&op).map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
+    if argv_targets_host(&argv) {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "refusing to target the host display",
+        ));
+    }
+    let (guests, handle) = {
+        let inner = state.lock().await;
+        require_token(&inner, headers, Capability::Lease)?;
+        let live = inner
+            .live
+            .as_ref()
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "no live lease"))?;
+        if live.lease.id.0 != id {
+            return Err(ApiError::new(StatusCode::NOT_FOUND, "lease not found"));
+        }
+        (Arc::clone(&inner.guests), live.handle.clone())
+    };
+    tokio::task::spawn_blocking(move || guests.exec(&handle, &argv))
+        .await
+        .map_err(|e| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .map_err(|e| ApiError::new(StatusCode::BAD_GATEWAY, e.to_string()))
+}
+
+/// HTTP API error. Shared with the lease-scoped guest view.
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
 }
 
 impl ApiError {
-    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+    pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,
             message: message.into(),
@@ -528,7 +717,7 @@ mod tests {
         assert!(body["code"].as_str().unwrap().contains('-'));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn lease_create_end_records_occupancy_seconds() {
         let state = eligible_state();
         let token = pair_token(&state).await;
@@ -613,5 +802,139 @@ mod tests {
             .unwrap();
         let (status, body) = oneshot(state, req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+
+    #[tokio::test]
+    async fn no_lease_view_and_actions_fail() {
+        let state = eligible_state();
+        let token = pair_token(&state).await;
+
+        let req = Request::builder()
+            .uri("/v1/leases/l_missing/screenshot")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, body) = oneshot(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("lease"), "{body}");
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/leases/l_missing/actions")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "op": "click", "x": 1, "y": 2 }).to_string(),
+            ))
+            .unwrap();
+        let (status, _) = oneshot(state.clone(), req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let req = Request::builder()
+            .uri("/v1/leases/l_missing/view")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = oneshot(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn screenshot_and_view_require_lease_bearer() {
+        let state = eligible_state();
+        let req = Request::builder()
+            .uri("/v1/leases/l_x/screenshot")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = oneshot(state, req).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn end_lease_tears_down_loopback_view() {
+        let state = eligible_state();
+        let token = pair_token(&state).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/leases")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({ "os": "linux" }).to_string()))
+            .unwrap();
+        let (status, body) = oneshot(state.clone(), req).await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let id = body["id"].as_str().unwrap().to_string();
+        let viewer = body["viewer_url"].as_str().expect("viewer_url").to_string();
+        assert!(
+            viewer.starts_with("http://127.0.0.1:"),
+            "view must be loopback: {viewer}"
+        );
+        assert!(!viewer.contains("0.0.0.0"), "{viewer}");
+
+        let client = reqwest_get_ok(&viewer, &token).await;
+        assert_eq!(client.0, StatusCode::OK);
+        assert!(client.1.contains("GUEST desktop"), "{}", client.1);
+
+        let req = Request::builder()
+            .uri(format!("/v1/leases/{id}/screenshot"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(state.clone()).oneshot(req).await.expect("router");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.expect("body").to_bytes();
+        assert!(bytes.starts_with(crate::action::PNG_MAGIC), "guest PNG");
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri(format!("/v1/leases/{id}"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = oneshot(state.clone(), req).await;
+        assert_eq!(status, StatusCode::OK);
+
+        // View port must die with the lease.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let gone = reqwest_get_status(&viewer, &token).await;
+        assert!(
+            gone.is_err() || gone == Ok(StatusCode::NOT_FOUND),
+            "view must be gone after DELETE, got {gone:?}"
+        );
+
+        let req = Request::builder()
+            .uri(format!("/v1/leases/{id}/screenshot"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let (status, _) = oneshot(state, req).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn reqwest_get_ok(url: &str, token: &str) -> (StatusCode, String) {
+        let client = ureq_get(url, token);
+        let status = StatusCode::from_u16(client.status()).unwrap();
+        let text = client.into_string().unwrap_or_default();
+        (status, text)
+    }
+
+    async fn reqwest_get_status(url: &str, token: &str) -> Result<StatusCode, String> {
+        match ureq::get(url)
+            .set("authorization", &format!("Bearer {token}"))
+            .timeout(std::time::Duration::from_secs(1))
+            .call()
+        {
+            Ok(resp) => Ok(StatusCode::from_u16(resp.status()).unwrap()),
+            Err(ureq::Error::Status(code, _)) => Ok(StatusCode::from_u16(code).unwrap()),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn ureq_get(url: &str, token: &str) -> ureq::Response {
+        ureq::get(url)
+            .set("authorization", &format!("Bearer {token}"))
+            .timeout(std::time::Duration::from_secs(2))
+            .call()
+            .expect("view get")
     }
 }

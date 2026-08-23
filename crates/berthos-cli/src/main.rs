@@ -44,6 +44,12 @@ enum Command {
     Pair(PairArgs),
     /// Create a local loopback Linux lease (requires a paired node).
     Up(UpArgs),
+    /// Print the loopback guest view URL for the live lease.
+    View(ViewArgs),
+    /// MCP stdio server. Tools drive the live guest only.
+    Mcp(McpArgs),
+    /// End the live lease (destroy guest + view). Occupancy receipt.
+    End(EndArgs),
 }
 
 #[derive(Parser, Debug)]
@@ -98,6 +104,23 @@ struct UpArgs {
     url: Option<String>,
 }
 
+#[derive(Parser, Debug)]
+struct ViewArgs {
+    /// Node URL. Defaults to the last `berth pair` URL.
+    #[arg(long)]
+    url: Option<String>,
+}
+
+#[derive(Parser, Debug)]
+struct McpArgs {}
+
+#[derive(Parser, Debug)]
+struct EndArgs {
+    /// Node URL. Defaults to the last `berth pair` URL.
+    #[arg(long)]
+    url: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum IntentArg {
     Private,
@@ -137,6 +160,11 @@ fn main() -> Result<()> {
         }
         Command::Pair(args) => cmd_pair(args),
         Command::Up(args) => cmd_up(args),
+        Command::View(args) => cmd_view(args),
+        Command::Mcp(_) => {
+            berthos_mcp::serve_blocking(&berthos_home()).map_err(|e| anyhow::anyhow!(e))
+        }
+        Command::End(args) => cmd_end(args),
     }
 }
 
@@ -190,6 +218,7 @@ async fn cmd_node_up(args: NodeUpArgs) -> Result<()> {
     eprintln!("eligibility: GET http://{bind}/v1/eligibility");
     eprintln!("this repo does not take payments; listings live in https://github.com/hexuria/berth-market");
     eprintln!("next: berth pair --code {code}   then   berth up --os linux");
+    eprintln!("after a lease: berth view   (guest noVNC on 127.0.0.1)   or   berth mcp");
 
     berthos_node::serve(state, bind).await?;
     Ok(())
@@ -256,7 +285,65 @@ fn cmd_up(args: UpArgs) -> Result<()> {
         lease.quote.notional_usd_per_hour
     );
     println!("settlement: {}", lease.quote.settlement.note);
+    if let Some(viewer) = &lease.viewer_url {
+        println!("viewer {viewer}");
+        println!("open with: berth view");
+        println!("agent: berth mcp  (lease bearer from ~/.berthos/client.toml)");
+    }
     Ok(())
+}
+
+fn cmd_view(args: ViewArgs) -> Result<()> {
+    let client = read_client_config(&berthos_home()).context("not paired; run berth pair")?;
+    let url = args
+        .url
+        .as_deref()
+        .unwrap_or(&client.url)
+        .trim_end_matches('/');
+    let lease = live_lease(url, &client.token)?;
+    let viewer = lease
+        .viewer_url
+        .context("live lease has no viewer_url; is the node too old?")?;
+    if !viewer.contains("127.0.0.1") && !viewer.contains("[::1]") && !viewer.contains("localhost") {
+        bail!("viewer_url is not loopback; refusing to print a bind-all view");
+    }
+    let sep = if viewer.contains('?') { '&' } else { '?' };
+    println!("{viewer}{sep}token={}", client.token);
+    eprintln!("Authorization: Bearer <lease token in ~/.berthos/client.toml>");
+    eprintln!("this is the isolated GUEST desktop, not the host DISPLAY");
+    Ok(())
+}
+
+fn cmd_end(args: EndArgs) -> Result<()> {
+    let client = read_client_config(&berthos_home()).context("not paired; run berth pair")?;
+    let url = args
+        .url
+        .as_deref()
+        .unwrap_or(&client.url)
+        .trim_end_matches('/');
+    let lease = live_lease(url, &client.token)?;
+    let resp = ureq::delete(&format!("{url}/v1/leases/{}", lease.id))
+        .set("authorization", &format!("Bearer {}", client.token))
+        .call()
+        .context("lease end failed")?;
+    let receipt: berthos_protocol::Receipt = resp.into_json()?;
+    println!(
+        "lease {} ended; {} occupancy-seconds (billed {}); view is gone",
+        receipt.lease_id, receipt.occupancy_seconds, receipt.billed_seconds
+    );
+    println!("settlement: {}", receipt.settlement.note);
+    Ok(())
+}
+
+fn live_lease(url: &str, token: &str) -> Result<Lease> {
+    let resp = ureq::get(&format!("{url}/v1/leases"))
+        .set("authorization", &format!("Bearer {token}"))
+        .call()
+        .context("list leases failed")?;
+    let leases: Vec<Lease> = resp.into_json()?;
+    leases.into_iter().next().context(
+        "no live lease; create one with berth up --os linux (payments are not in this repo)",
+    )
 }
 
 fn parse_os(raw: &str) -> Result<GuestOs> {
