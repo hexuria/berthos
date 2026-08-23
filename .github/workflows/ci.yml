@@ -1,0 +1,46 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: test
+        run: cargo test --workspace --locked
+      - name: guest image labels
+        run: |
+          set -euo pipefail
+          grep -q 'berthos.guest.version="v1"' images/linux-desktop/Dockerfile
+          grep -q 'berthos.desktop="xvfb-openbox-chromium"' images/linux-desktop/Dockerfile
+          grep -q 'berthos.egress.policy="default-deny"' images/linux-desktop/Dockerfile
+      - name: doctor fail-closed smoke
+        run: |
+          set -euo pipefail
+          cargo build -p berthos-cli --locked
+          bin=./target/debug/berth
+          if "$bin" doctor --simulate laptop; then
+            echo "expected laptop to fail closed" >&2
+            exit 1
+          fi
+          if "$bin" doctor --simulate missing-image; then
+            echo "expected missing-image to fail closed" >&2
+            exit 1
+          fi
+          if "$bin" doctor --simulate bind-all; then
+            echo "expected bind-all to fail closed" >&2
+            exit 1
+          fi
+          "$bin" doctor --simulate laptop --json | grep -q '"eligible": false'
