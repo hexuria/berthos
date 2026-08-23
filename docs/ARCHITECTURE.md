@@ -67,6 +67,8 @@ The crates publish conceptually as **berthos**; the command they install is **`b
 
 Nothing that participates (node start, park, lease create) proceeds on a red doctor. Evaluation is pure and fail-closed: see [ELIGIBILITY.md](ELIGIBILITY.md).
 
+`GET /v1/eligibility` returns a **storeable attestation**: `ok`, `class`, `checks[]`, image labels, and `timestamp` (`source` is `berthos.doctor`). berth-market persists that JSON; it does not re-run isolation. A production node re-probes Docker on that GET so the document matches the daemon and labels that exist now.
+
 ```
             observe facts
                  │
@@ -138,6 +140,8 @@ The intended production path is: snapshot (or mark a golden image) at lease star
 - **no** `-e` secrets, **no** host bind-mounts of the node home, **no** host network, **no** host display
 
 The image must already carry `berthos.guest.version=v1`, `berthos.desktop=xvfb-openbox-chromium`, and `berthos.egress.policy=default-deny`. The doctor inspects those labels. An image built before the contract existed inspects fine and is still refused.
+
+After `docker run`, the node inspects the container and **refuses** it if `NetworkMode` is not `none`, if it is privileged, or if a host display socket (`/tmp/.X11-unix`, Wayland) was mounted. Host cursor / host `DISPLAY` are never passed in.
 
 ## What is deliberately absent
 

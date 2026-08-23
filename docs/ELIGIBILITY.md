@@ -12,6 +12,8 @@ berth doctor --json
 
 Live probes feed [`Facts`](../crates/berthos-protocol/src/eligibility.rs). Evaluation lives in [`berthos_node::evaluate`](../crates/berthos-node/src/eligibility.rs). Probe errors become conservative facts (`runtime_running=false`, `guest_image=None`, `free_vcpu=0`) — they are not omitted.
 
+When Docker is available, `berth doctor` (no `--simulate`) talks to the daemon (`docker info`) and inspects `berthos-linux-desktop:v1` for the labeled contract. `--simulate` stays fail-closed only; it cannot produce `ok: true`.
+
 ## Required checks
 
 | Id | Pass | Fail closed when |
@@ -31,6 +33,52 @@ Live probes feed [`Facts`](../crates/berthos-protocol/src/eligibility.rs). Evalu
 | Id | Meaning |
 | --- | --- |
 | `tunnel` | `cloudflared` (or equivalent) present. Missing is fine for loopback. A missing tunnel is **not** a reason to bind `0.0.0.0`. |
+
+## Attestation schema (`GET /v1/eligibility`)
+
+This is the stable JSON [berth-market](https://github.com/hexuria/berth-market) stores. It is the same document `berth doctor --json` prints. The market does not re-run isolation; it persists `ok`, `class`, `checks`, image labels, and `timestamp`.
+
+```json
+{
+  "protocol": "v1",
+  "source": "berthos.doctor",
+  "ok": true,
+  "eligible": true,
+  "class": "vm-guest",
+  "intent": "private",
+  "checks": [
+    { "id": "class", "status": "pass", "detail": "class=vm-guest (isolated guest, not the host desktop)" },
+    { "id": "runtime", "status": "pass", "detail": "Docker (or equivalent) is running" },
+    { "id": "guest_image", "status": "pass", "detail": "berthos-linux-desktop:v1 labels ok (v1, xvfb-openbox-chromium, default-deny)" }
+  ],
+  "image": {
+    "name": "berthos-linux-desktop:v1",
+    "labels": {
+      "berthos.guest.version": "v1",
+      "berthos.desktop": "xvfb-openbox-chromium",
+      "berthos.egress.policy": "default-deny"
+    }
+  },
+  "timestamp": "2026-08-23T07:21:00Z"
+}
+```
+
+| Field | Type | Store? | Notes |
+| --- | --- | --- | --- |
+| `protocol` | string | yes | Wire version (`v1`). |
+| `source` | string | yes | Always `berthos.doctor`. |
+| `ok` | bool | **required** | `true` only when no required check failed. berth-market rejects `ok: false`. |
+| `eligible` | bool | yes | Same value as `ok` (doctor wording). |
+| `class` | string | **required** | `vm-guest` \| `dedicated-server` \| `laptop`. `laptop` is never eligible. There is no `host-desktop` class. |
+| `intent` | string | yes | `private` \| `public`. |
+| `checks` | array | **required** | Rows with `id`, `status` (`pass` \| `fail` \| `warn`), `detail`. |
+| `image` | object \| null | **required** | `null` when the guest image is missing. Otherwise name + Docker labels. |
+| `image.labels` | object | yes | Exact keys: `berthos.guest.version`, `berthos.desktop`, `berthos.egress.policy`. |
+| `timestamp` | string | **required** | RFC 3339 UTC. When this report was evaluated. |
+
+`ok` is the gate. A document with `ok: true` and `class: "laptop"` is inconsistent and must not be produced; evaluation refuses laptop first.
+
+A production node re-probes Docker on `GET /v1/eligibility` so the stored attestation matches the daemon and image that exist *now*.
 
 ## Guest image labels
 
@@ -82,7 +130,19 @@ berth doctor --simulate missing-image   # exit 1
 berth doctor --simulate bind-all        # exit 1
 ```
 
-`--simulate` cannot produce `eligible: true`. There is no "pretend I passed" switch.
+`--simulate` cannot produce `eligible: true` / `ok: true`. There is no "pretend I passed" switch.
+
+Live Docker tests **skip** when the daemon is missing (the default `linux` CI job). They run when Docker is present and the labeled image exists.
+
+## CI and the live doctor
+
+| Path | Docker | What runs |
+| --- | --- | --- |
+| `.github/workflows/ci.yml` job `linux` | may be present, image not built | `cargo test` (live probes skip or fail-closed on missing image) + `--simulate` smoke |
+| `.github/workflows/ci.yml` job `docker-live` | required | `docker build -t berthos-linux-desktop:v1 images/linux-desktop`, then `berth doctor --json` (must be `ok: true`) and `cargo test` including isolated lease start/destroy |
+| Manual box | required for a green doctor | same as Quick start |
+
+If a runner has no Docker, keep the `linux` job; do not skip unit tests. The `docker-live` job is the documented path that builds the image and runs the live doctor.
 
 ## Manual path
 
@@ -90,8 +150,9 @@ On a machine with Docker:
 
 1. `docker build -t berthos-linux-desktop:v1 images/linux-desktop`
 2. Write `~/.berthos/node.toml` with `class = "vm-guest"`, `bind = "127.0.0.1"`.
-3. `berth doctor` — every required row `pass`, `tunnel` may `warn`.
+3. `berth doctor` — every required row `pass`, `tunnel` may `warn`. JSON has `ok: true` and the image labels.
 4. `berth node up` — prints a pairing code, listens on `127.0.0.1:7432`.
-5. `GET http://127.0.0.1:7432/v1/eligibility` matches the CLI report.
+5. `GET http://127.0.0.1:7432/v1/eligibility` matches the CLI report (same schema).
+6. `berth pair` then `berth up --os linux` — starts `docker run --network none`. `DELETE /v1/leases/{id}` destroys the container and returns occupancy seconds.
 
 If step 3 is red, stop. Do not "just start the node anyway."

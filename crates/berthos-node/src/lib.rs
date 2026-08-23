@@ -14,10 +14,16 @@ pub mod pairing;
 pub mod probes;
 
 pub use config::{NodeConfig, NodeConfigFile};
-pub use eligibility::{eligible_private_facts, evaluate};
-pub use guest::{DockerGuest, GuestRuntime, MemoryGuest};
+pub use eligibility::{eligible_private_facts, evaluate, evaluate_at};
+pub use guest::{
+    inspect_isolation, isolated_run_args, DockerGuest, GuestHandle, GuestIsolation, GuestRuntime,
+    GuestSpec, MemoryGuest,
+};
 pub use http::{new_state, new_state_with_report, reject_if_bind_all, router, serve, NodeState};
-pub use probes::{observe, simulate, SimulateCase};
+pub use probes::{
+    default_facts_config, docker_available, labeled_guest_image_ready, observe, simulate,
+    SimulateCase,
+};
 
 use std::net::IpAddr;
 

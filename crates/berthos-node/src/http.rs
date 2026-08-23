@@ -30,7 +30,7 @@ use crate::{NodeConfig, NodeError};
 pub struct NodeInner {
     /// Advertisement + bind.
     pub config: NodeConfig,
-    /// Last doctor report. Re-evaluated at start; served as-is.
+    /// Last doctor report. Re-evaluated at start; served as-is unless live.
     pub report: DoctorReport,
     /// Parked nodes accept new leases.
     pub parked: bool,
@@ -40,6 +40,9 @@ pub struct NodeInner {
     pub live: Option<LiveLease>,
     /// Guest runtime (Docker or memory).
     pub guests: Arc<dyn GuestRuntime>,
+    /// When true, `GET /v1/eligibility` re-runs live probes (production).
+    /// Tests that inject a report leave this false so the fixture is stable.
+    pub live_eligibility: bool,
 }
 
 /// A live lease plus its guest handle.
@@ -138,7 +141,10 @@ async fn health() -> impl IntoResponse {
 }
 
 async fn eligibility(State(state): State<NodeState>) -> Json<DoctorReport> {
-    let inner = state.lock().await;
+    let mut inner = state.lock().await;
+    if inner.live_eligibility {
+        inner.report = evaluate(&crate::probes::observe(&inner.config));
+    }
     Json(inner.report.clone())
 }
 
@@ -387,6 +393,7 @@ pub fn new_state(config: NodeConfig, guests: Arc<dyn GuestRuntime>) -> NodeState
         pairing: PairingBooth::new(),
         live: None,
         guests,
+        live_eligibility: true,
     }))
 }
 
@@ -403,6 +410,7 @@ pub fn new_state_with_report(
         pairing: PairingBooth::new(),
         live: None,
         guests,
+        live_eligibility: false,
     }))
 }
 
@@ -486,7 +494,13 @@ mod tests {
             .unwrap();
         let (status, body) = oneshot(state, req).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], false);
         assert_eq!(body["eligible"], false);
+        assert_eq!(body["class"], "laptop");
+        assert_eq!(body["source"], "berthos.doctor");
+        assert!(body["checks"].is_array());
+        assert!(body["timestamp"].as_str().is_some());
+        assert!(body["image"].is_object());
     }
 
     #[tokio::test]
@@ -582,5 +596,22 @@ mod tests {
             .unwrap();
         let (status, _) = oneshot(state, req).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn windows_lease_rejected() {
+        let state = eligible_state();
+        let token = pair_token(&state).await;
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/leases")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({ "os": "windows-home-oem" }).to_string(),
+            ))
+            .unwrap();
+        let (status, body) = oneshot(state, req).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 }
