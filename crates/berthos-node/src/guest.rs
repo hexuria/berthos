@@ -78,6 +78,8 @@ pub trait GuestRuntime: Send + Sync {
     fn start(&self, lease_id: &LeaseId, spec: &GuestSpec) -> Result<GuestHandle, GuestError>;
     /// Destroy the guest. v1 "revert".
     fn destroy(&self, handle: &GuestHandle) -> Result<(), GuestError>;
+    /// Run a command *inside* the guest. Never the host desktop.
+    fn exec(&self, handle: &GuestHandle, argv: &[String]) -> Result<Vec<u8>, GuestError>;
 }
 
 /// Guest runtime errors.
@@ -183,6 +185,30 @@ impl GuestRuntime for DockerGuest {
                 Err(e)
             }
         }
+    }
+
+    fn exec(&self, handle: &GuestHandle, argv: &[String]) -> Result<Vec<u8>, GuestError> {
+        if !guest_exec_allowed(argv) {
+            return Err(GuestError::Isolation(
+                "refusing guest exec that is not the driver or a noVNC asset".into(),
+            ));
+        }
+        let output = Command::new("docker")
+            .arg("exec")
+            .arg(&handle.container)
+            .args(argv)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|e| GuestError::Runtime(e.to_string()))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(GuestError::Runtime(format!(
+                "docker exec {} failed: {stderr}",
+                handle.container
+            )));
+        }
+        Ok(output.stdout)
     }
 
     fn destroy(&self, handle: &GuestHandle) -> Result<(), GuestError> {
@@ -304,6 +330,27 @@ impl GuestRuntime for MemoryGuest {
         Ok(GuestHandle { container })
     }
 
+    fn exec(&self, handle: &GuestHandle, argv: &[String]) -> Result<Vec<u8>, GuestError> {
+        let live = self.live.lock().expect("memory guest lock");
+        if !live.iter().any(|c| c == &handle.container) {
+            return Err(GuestError::Runtime("no live guest".into()));
+        }
+        if !guest_exec_allowed(argv) {
+            return Err(GuestError::Isolation(
+                "refusing guest exec that is not the driver or a noVNC asset".into(),
+            ));
+        }
+        if argv.get(1).map(String::as_str) == Some("screenshot") {
+            return Ok(crate::action::MINIMAL_PNG.to_vec());
+        }
+        if argv.first().map(String::as_str) == Some("cat") {
+            return Err(GuestError::Runtime(
+                "memory guest has no noVNC assets".into(),
+            ));
+        }
+        Ok(Vec::new())
+    }
+
     fn destroy(&self, handle: &GuestHandle) -> Result<(), GuestError> {
         self.live
             .lock()
@@ -311,6 +358,28 @@ impl GuestRuntime for MemoryGuest {
             .retain(|c| c != &handle.container);
         Ok(())
     }
+}
+
+/// Driver argv, or `cat` of a guest noVNC static file. Nothing else.
+pub fn guest_exec_allowed(argv: &[String]) -> bool {
+    if argv.is_empty() {
+        return false;
+    }
+    if argv[0] == crate::action::ACTION_BIN {
+        return !crate::action::argv_targets_host(argv);
+    }
+    if argv[0] == "cat" && argv.len() == 2 {
+        return novnc_asset_path(&argv[1]);
+    }
+    false
+}
+
+fn novnc_asset_path(path: &str) -> bool {
+    if !path.starts_with("/usr/share/novnc/") || path.contains("..") {
+        return false;
+    }
+    path.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
 }
 
 #[cfg(test)]
@@ -385,5 +454,27 @@ mod tests {
         }]"#;
         let isolation = isolation_from_inspect_json(json).expect("parse");
         assert!(isolation.is_isolated());
+    }
+
+    #[test]
+    fn guest_exec_allows_driver_and_novnc_only() {
+        assert!(guest_exec_allowed(&[
+            crate::action::ACTION_BIN.into(),
+            "screenshot".into()
+        ]));
+        assert!(guest_exec_allowed(&[
+            "cat".into(),
+            "/usr/share/novnc/vnc.html".into()
+        ]));
+        assert!(!guest_exec_allowed(&["cat".into(), "/etc/passwd".into()]));
+        assert!(!guest_exec_allowed(&[
+            "xdotool".into(),
+            "click".into(),
+            "1".into()
+        ]));
+        assert!(!guest_exec_allowed(&[
+            "cat".into(),
+            "/usr/share/novnc/../etc/passwd".into()
+        ]));
     }
 }

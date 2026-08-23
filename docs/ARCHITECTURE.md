@@ -7,20 +7,22 @@ Payments, listings, and wallets are **out of this process**. A quote is a number
 ## Components
 
 ```
-crates/berthos-cli        `berth` binary (doctor, node up, pair, up)
+crates/berthos-cli        `berth` binary (doctor, node up, pair, up, view, mcp, end)
         │
+        ├── crates/berthos-mcp        stdio MCP → live guest only
         ▼
-crates/berthos-node       library: eligibility gate + Axum on 127.0.0.1
+crates/berthos-node       library: eligibility + Axum + lease-scoped loopback view
         │
         ├── crates/berthos-protocol   lease / quote / receipt / doctor types
-        └── images/linux-desktop      labeled guest (Xvfb + openbox + Chromium)
+        └── images/linux-desktop      labeled guest (Xvfb + openbox + Chromium + driver)
 ```
 
 | Piece | Responsibility | Not responsible for |
 | --- | --- | --- |
 | `berthos-protocol` | Shared vocabulary. Occupancy unit is **seconds**. | Gas tokens, catalogs, x402 |
 | `berthos-node` | Fail-closed doctor, pairing booth, park/unpark, lease create/end, guest destroy | Host desktop control, bind-all HTTP |
-| `berthos-cli` | Operator/agent entrypoints | A console SPA, MCP, marketplace |
+| `berthos-cli` | Operator/agent entrypoints (`berth view`, `berth mcp`) | A console SPA, marketplace |
+| `berthos-mcp` | Stdio MCP: screenshot / click / type / end on the **live guest** | Host desktop, wallets |
 | `linux-desktop` | Reproducible isolated guest with versioned labels | Host networking, secrets |
 
 The crates publish conceptually as **berthos**; the command they install is **`berth`**.
@@ -108,7 +110,7 @@ Capability tokens, not ambient trust.
 2. Loopback `GET /v1/pairing` reveals it. A non-loopback peer gets `404`. Forwarded headers are ignored.
 3. `POST /v1/pair` `{ "code" }` returns a bearer token and rotates the code.
 4. The node stores **SHA-256(token)** plus capabilities (`operator`, `lease`). The raw token is shown once and kept in `~/.berthos/client.toml` mode `0600` on the client.
-5. Park/unpark require `operator`. Lease create/end require `lease`. v1 default pair grants both so one CLI can do both jobs.
+5. Park/unpark require `operator`. Lease create/end, guest view, and MCP require `lease`. v1 default pair grants both so one CLI can do both jobs.
 
 A stolen guest cannot mint a token. The guest never sees the booth.
 
@@ -143,9 +145,14 @@ The image must already carry `berthos.guest.version=v1`, `berthos.desktop=xvfb-o
 
 After `docker run`, the node inspects the container and **refuses** it if `NetworkMode` is not `none`, if it is privileged, or if a host display socket (`/tmp/.X11-unix`, Wayland) was mounted. Host cursor / host `DISPLAY` are never passed in.
 
+## Guest view and MCP
+
+After `POST /v1/leases` the node binds a **per-lease** HTTP viewer on `127.0.0.1:0` (never `0.0.0.0`). The guest stays `--network none`; the node maps guest Xvfb through `docker exec` (screenshot / click / type) and, for noVNC, `docker exec socat` to guest `x11vnc` on guest localhost `:5900`. `DELETE /v1/leases/{id}` drops that listener.
+
+`berth mcp` is stdio JSON-RPC. Tools refuse if `GET /v1/leases` is empty. They never set host `DISPLAY`. See [SESSION.md](SESSION.md).
+
 ## What is deliberately absent
 
-- MCP / computer-use adapters (next layer, not this skeleton)
 - Operator console SPA
 - Cloudflare tunnel spawn (doctor warns if `cloudflared` is missing; v1 loopback does not need it)
 - Workspace volumes, S3, rclone

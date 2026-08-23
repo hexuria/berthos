@@ -6,13 +6,16 @@
 
 #![forbid(unsafe_code)]
 
+pub mod action;
 pub mod config;
 pub mod eligibility;
 pub mod guest;
 pub mod http;
 pub mod pairing;
 pub mod probes;
+pub mod view;
 
+pub use action::{action_argv, argv_targets_host, GuestOp, MINIMAL_PNG, PNG_MAGIC};
 pub use config::{NodeConfig, NodeConfigFile};
 pub use eligibility::{eligible_private_facts, evaluate, evaluate_at};
 pub use guest::{
@@ -24,6 +27,7 @@ pub use probes::{
     default_facts_config, docker_available, labeled_guest_image_ready, observe, simulate,
     SimulateCase,
 };
+pub use view::{view_bind_is_loopback, LoopbackView};
 
 use std::net::IpAddr;
 

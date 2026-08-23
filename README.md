@@ -7,10 +7,10 @@ This repository is the **node**: a fail-closed eligibility doctor, a loopback-on
 It is **not** the market. Listings, wallets, x402, USDC, and tokens live in the sibling repo **[berth-market](https://github.com/hexuria/berth-market)**. Quotes printed here are occupancy seconds. Nothing is charged in this process.
 
 ```
-operator / agent CLI (berth)
+operator / agent CLI (berth)     berth view / berth mcp
         │  HTTP on 127.0.0.1 (tunnel optional, later)
         ▼
-berthos-node  —  park / unpark / lease / eligibility
+berthos-node  —  park / unpark / lease / eligibility / guest view
         │  isolated guest only
         ▼
 Linux desktop (Xvfb + openbox + Chromium)  ← not the host cursor, not Finder
@@ -118,6 +118,38 @@ berth up --os linux
 
 `--os windows` and `--os macos` are rejected. Ending the lease destroy-and-recreates the guest (v1 revert; snapshot/restore is documented, not implemented). Occupancy is wall-clock seconds the guest is held, not clicks.
 
+### 6. Guest view + MCP (buyer / agent)
+
+After a live linux lease, the node exposes a **loopback-only** view of **that guest** (noVNC or equivalent). It is not the host desktop. It is not published on `0.0.0.0`. It dies with `DELETE /v1/leases/{id}` / `berth end`.
+
+```sh
+berth view
+# http://127.0.0.1:<port>/?token=<lease-bearer>
+# open on this machine — GUEST Xvfb, not the host DISPLAY
+
+berth mcp
+# stdio JSON-RPC: berth_screenshot, berth_click, berth_type, berth_key, berth_end
+# tools refuse if no lease is live
+```
+
+View and MCP require the **`lease` bearer** from `berth pair` (`Authorization: Bearer <token>`, stored in `~/.berthos/client.toml`). The HTML viewer also accepts `?token=` on loopback. See [docs/SESSION.md](docs/SESSION.md).
+
+**Two-role reproduce (no payments in this repo).** Operator parks the node; buyer (after a market pay in berth-market, or locally with no charge) opens the guest:
+
+```sh
+# operator
+berth node up
+
+# buyer / agent (same host in v1)
+berth pair --code ABCD-EFGH
+berth up --os linux
+berth view          # loopback guest desktop
+berth mcp           # agent screenshot / click / type / end
+berth end           # view gone; occupancy receipt
+```
+
+Nothing is charged here. Listings and settlement stay in berth-market.
+
 ## HTTP (127.0.0.1 only)
 
 | Method | Path | Auth | Notes |
@@ -129,9 +161,13 @@ berth up --os linux
 | `POST` | `/v1/unpark` | operator | `409` if a lease is live |
 | `GET` | `/v1/pairing` | loopback | current pairing code |
 | `POST` | `/v1/pair` | code | returns a bearer token |
-| `POST` | `/v1/leases` | lease | create; `os=linux` only |
+| `POST` | `/v1/leases` | lease | create; `os=linux` only; includes loopback `viewer_url` |
 | `GET` | `/v1/leases` | lease | live leases |
-| `DELETE` | `/v1/leases/{id}` | lease | end; returns an occupancy receipt |
+| `GET` | `/v1/leases/{id}` | lease | one live lease |
+| `GET` | `/v1/leases/{id}/view` | lease | `{ viewer_url }` for the guest (not the host) |
+| `GET` | `/v1/leases/{id}/screenshot` | lease | guest PNG; `404` if no live lease |
+| `POST` | `/v1/leases/{id}/actions` | lease | guest `click` / `type` / `key` |
+| `DELETE` | `/v1/leases/{id}` | lease | end; occupancy receipt; view dies |
 
 Authorization: `Authorization: Bearer <token>`.
 

@@ -128,6 +128,102 @@ async fn live_http_lease_returns_occupancy_receipt() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn live_view_and_screenshot_die_with_lease() {
+    if skip_without_docker() || skip_without_labeled_image() {
+        return;
+    }
+    let config = berthos_node::probes::default_facts_config();
+    let report = evaluate(&observe(&config));
+    if !report.ok {
+        eprintln!("skip live view: doctor not green: {report:?}");
+        return;
+    }
+    let state = new_state_with_report(config, report, Arc::new(DockerGuest));
+    let token = pair_token(&state).await;
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/leases")
+        .header("authorization", format!("Bearer {token}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({ "os": "linux", "vcpu": 1, "mem_gib": 1 }).to_string(),
+        ))
+        .unwrap();
+    let (status, body) = oneshot(state.clone(), req).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let id = body["id"].as_str().expect("lease id").to_string();
+    let viewer = body["viewer_url"].as_str().expect("viewer_url").to_string();
+    assert!(
+        viewer.starts_with("http://127.0.0.1:"),
+        "view must be loopback: {viewer}"
+    );
+
+    // Guest Xvfb may take a moment after docker run.
+    let mut png = Vec::new();
+    for _ in 0..40 {
+        let req = Request::builder()
+            .uri(format!("/v1/leases/{id}/screenshot"))
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = router(state.clone()).oneshot(req).await.expect("router");
+        if resp.status() == StatusCode::OK {
+            png = resp
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes()
+                .to_vec();
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert!(
+        png.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "live guest screenshot must be a PNG ({} bytes)",
+        png.len()
+    );
+
+    let html = ureq::get(&viewer)
+        .set("authorization", &format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(5))
+        .call()
+        .expect("view html");
+    assert_eq!(html.status(), 200);
+    let page = html.into_string().unwrap_or_default();
+    assert!(
+        page.contains("GUEST") || page.contains("noVNC") || page.contains("html"),
+        "{page}"
+    );
+
+    let req = Request::builder()
+        .method("DELETE")
+        .uri(format!("/v1/leases/{id}"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = oneshot(state.clone(), req).await;
+    assert_eq!(status, StatusCode::OK);
+
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    let gone = ureq::get(&viewer)
+        .set("authorization", &format!("Bearer {token}"))
+        .timeout(std::time::Duration::from_secs(1))
+        .call();
+    assert!(gone.is_err(), "loopback view must die with the lease");
+
+    let req = Request::builder()
+        .uri(format!("/v1/leases/{id}/screenshot"))
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = oneshot(state, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
 async fn oneshot(
     state: berthos_node::NodeState,
     req: Request<Body>,
