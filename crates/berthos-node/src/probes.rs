@@ -8,6 +8,19 @@ use berthos_protocol::{
 
 use crate::config::NodeConfig;
 
+/// True when `docker info` succeeds. Missing binary or a down daemon is false.
+pub fn docker_available() -> bool {
+    docker_running()
+}
+
+/// True when the required guest image is present **and** carries v1 labels.
+pub fn labeled_guest_image_ready(name: &str) -> bool {
+    docker_available()
+        && inspect_guest_image(name)
+            .map(|image| image.matches_required())
+            .unwrap_or(false)
+}
+
 /// Run live probes and fold them into [`Facts`]. Probe failures become
 /// conservative (false / missing / zero) values — never "skip this check".
 pub fn observe(config: &NodeConfig) -> Facts {
@@ -191,5 +204,57 @@ mod tests {
     fn simulate_rejects_eligible_keyword() {
         assert!(SimulateCase::parse("eligible").is_err());
         assert!(SimulateCase::parse("pass").is_err());
+    }
+
+    #[test]
+    fn live_docker_probe_skips_when_daemon_missing() {
+        if docker_available() {
+            let facts = observe(&default_facts_config());
+            assert!(
+                facts.runtime_running,
+                "docker info succeeded so runtime_running must be true"
+            );
+            return;
+        }
+        let facts = observe(&default_facts_config());
+        assert!(
+            !facts.runtime_running,
+            "missing docker must fail closed, not skip"
+        );
+        assert!(facts.guest_image.is_none());
+    }
+
+    #[test]
+    fn live_docker_requires_labeled_guest_image() {
+        if !docker_available() {
+            eprintln!("skip live image probe: docker daemon not available");
+            return;
+        }
+        let facts = observe(&default_facts_config());
+        assert!(facts.runtime_running);
+        match &facts.guest_image {
+            None => {
+                let report = crate::eligibility::evaluate(&facts);
+                assert!(!report.ok);
+                assert!(report.failed(berthos_protocol::CheckId::GuestImage));
+            }
+            Some(image) if image.matches_required() => {
+                assert_eq!(image.name, REQUIRED_GUEST_IMAGE);
+                assert_eq!(
+                    image.version_label,
+                    berthos_protocol::REQUIRED_GUEST_VERSION
+                );
+                assert_eq!(
+                    image.desktop_label,
+                    berthos_protocol::REQUIRED_DESKTOP_LABEL
+                );
+                assert_eq!(image.egress_label, berthos_protocol::REQUIRED_EGRESS_POLICY);
+            }
+            Some(image) => {
+                let report = crate::eligibility::evaluate(&facts);
+                assert!(!report.ok, "unlabeled image must fail closed: {image:?}");
+                assert!(report.failed(berthos_protocol::CheckId::GuestImage));
+            }
+        }
     }
 }

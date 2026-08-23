@@ -13,8 +13,9 @@ mod session;
 
 pub use eligibility::{
     Chassis, CheckId, CheckStatus, DoctorCheck, DoctorReport, EgressPolicy, Facts, GuestImage,
-    GuestOs, Intent, NodeClass, MIN_FREE_MEM_GIB, MIN_FREE_VCPU, REQUIRED_DESKTOP_LABEL,
-    REQUIRED_EGRESS_POLICY, REQUIRED_GUEST_IMAGE, REQUIRED_GUEST_VERSION,
+    GuestOs, ImageAttestation, ImageLabels, Intent, NodeClass, ATTESTATION_SOURCE,
+    MIN_FREE_MEM_GIB, MIN_FREE_VCPU, REQUIRED_DESKTOP_LABEL, REQUIRED_EGRESS_POLICY,
+    REQUIRED_GUEST_IMAGE, REQUIRED_GUEST_VERSION,
 };
 pub use session::{
     CreateLeaseRequest, Density, EndReason, Lease, LeaseId, LeaseState, OccupancyUnit, Quote,

@@ -123,7 +123,7 @@ berth up --os linux
 | Method | Path | Auth | Notes |
 | --- | --- | --- | --- |
 | `GET` | `/health` | no | liveness |
-| `GET` | `/v1/eligibility` | no | last doctor report |
+| `GET` | `/v1/eligibility` | no | storeable attestation (`ok`, `class`, `checks[]`, image labels, `timestamp`) |
 | `GET` | `/v1/node` | no | parked / eligible / live lease |
 | `POST` | `/v1/park` | operator | fail closed if ineligible |
 | `POST` | `/v1/unpark` | operator | `409` if a lease is live |
@@ -145,9 +145,11 @@ berth doctor --simulate missing-image   # exit 1
 berth doctor --simulate bind-all        # exit 1
 ```
 
-That is the automated smoke path. The manual path on a real box is the Quick start above: build the image, `berth doctor`, `berth node up`, `berth pair`, `berth up --os linux`.
+That is the automated smoke path when Docker is missing. Live probes (`berth doctor` without `--simulate`) talk to the daemon and require `berthos-linux-desktop:v1` with the labeled contract. CI job `linux` keeps unit tests and `--simulate` even if Docker is absent. Job `docker-live` builds the image and runs the live doctor plus isolated lease start/destroy.
 
-`cargo test` covers the same fail-closed cases as unit tests.
+The manual path on a real box is the Quick start above: build the image, `berth doctor`, `berth node up`, `berth pair`, `berth up --os linux`.
+
+`cargo test` covers the fail-closed cases as unit tests. Live Docker tests skip when the daemon or labeled image is missing.
 
 ## What this repo does not do
 

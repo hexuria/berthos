@@ -54,3 +54,38 @@ jobs:
             exit 1
           fi
           grep -q '"eligible": false' /tmp/berthos-doctor.json
+          grep -q '"ok": false' /tmp/berthos-doctor.json
+          grep -q '"class": "laptop"' /tmp/berthos-doctor.json
+
+  docker-live:
+    name: docker-live
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cache cargo
+        uses: Swatinem/rust-cache@v2
+      - name: docker available
+        run: docker info
+      - name: build labeled guest image
+        run: docker build -t berthos-linux-desktop:v1 images/linux-desktop
+      - name: image label contract
+        run: |
+          set -euo pipefail
+          labels=$(docker image inspect berthos-linux-desktop:v1 --format '{{json .Config.Labels}}')
+          echo "$labels"
+          echo "$labels" | grep -q '"berthos.guest.version":"v1"'
+          echo "$labels" | grep -q '"berthos.desktop":"xvfb-openbox-chromium"'
+          echo "$labels" | grep -q '"berthos.egress.policy":"default-deny"'
+      - name: live doctor
+        run: |
+          set -euo pipefail
+          cargo build -p berthos-cli --locked
+          ./target/debug/berth doctor --json | tee /tmp/berthos-live-doctor.json
+          grep -q '"ok": true' /tmp/berthos-live-doctor.json
+          grep -q '"eligible": true' /tmp/berthos-live-doctor.json
+          grep -q '"class": "vm-guest"' /tmp/berthos-live-doctor.json
+          grep -q 'berthos.guest.version' /tmp/berthos-live-doctor.json
+          grep -q 'timestamp' /tmp/berthos-live-doctor.json
+      - name: live tests
+        run: cargo test --workspace --locked

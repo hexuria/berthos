@@ -1,7 +1,10 @@
 //! Eligibility vocabulary. Evaluation (fail-closed) lives in `berthos-node`.
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
+/// Provenance marker on a storeable doctor attestation (`source`).
+pub const ATTESTATION_SOURCE: &str = "berthos.doctor";
 /// Image tag the doctor requires. Rebuild after changing labels.
 pub const REQUIRED_GUEST_IMAGE: &str = "berthos-linux-desktop:v1";
 /// Version label stamped on the guest image (`berthos.guest.version`).
@@ -103,6 +106,42 @@ impl GuestImage {
     }
 }
 
+/// Docker label contract copied onto a storeable attestation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageLabels {
+    /// `berthos.guest.version`.
+    #[serde(rename = "berthos.guest.version")]
+    pub guest_version: String,
+    /// `berthos.desktop`.
+    #[serde(rename = "berthos.desktop")]
+    pub desktop: String,
+    /// `berthos.egress.policy`.
+    #[serde(rename = "berthos.egress.policy")]
+    pub egress_policy: String,
+}
+
+/// Guest image block on [`DoctorReport`]. `null` when the image is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttestation {
+    /// Local image reference, e.g. `berthos-linux-desktop:v1`.
+    pub name: String,
+    /// Labels the doctor inspected (exact Docker keys).
+    pub labels: ImageLabels,
+}
+
+impl From<&GuestImage> for ImageAttestation {
+    fn from(image: &GuestImage) -> Self {
+        Self {
+            name: image.name.clone(),
+            labels: ImageLabels {
+                guest_version: image.version_label.clone(),
+                desktop: image.desktop_label.clone(),
+                egress_policy: image.egress_label.clone(),
+            },
+        }
+    }
+}
+
 /// Stable identifiers for doctor rows. Warnings do not fail the gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,17 +209,31 @@ pub struct DoctorCheck {
     pub detail: String,
 }
 
-/// Fail-closed doctor result. `eligible` is true only when no check failed.
+/// Fail-closed doctor result. `ok` / `eligible` are true only when no check failed.
+///
+/// This is the stable attestation document `GET /v1/eligibility` returns.
+/// berth-market stores it; it does not re-run isolation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DoctorReport {
     /// Protocol version the evaluator used.
     pub protocol: String,
+    /// Always [`ATTESTATION_SOURCE`].
+    pub source: String,
+    /// Attestation gate (`true` only when every required check passed).
+    pub ok: bool,
+    /// Same as [`Self::ok`]. Kept so existing doctor JSON still reads `eligible`.
+    pub eligible: bool,
+    /// Advertised berth class (`vm-guest` / `dedicated-server` / `laptop`).
+    pub class: NodeClass,
     /// Intent the operator asked the doctor to judge.
     pub intent: Intent,
-    /// True only if every required check passed.
-    pub eligible: bool,
     /// Individual rows, including warnings.
     pub checks: Vec<DoctorCheck>,
+    /// Inspected guest image and its Docker labels. `null` if missing.
+    pub image: Option<ImageAttestation>,
+    /// When this report was evaluated (UTC, RFC 3339).
+    #[serde(with = "time::serde::rfc3339")]
+    pub timestamp: OffsetDateTime,
 }
 
 impl DoctorReport {
@@ -232,4 +285,62 @@ pub struct Facts {
     pub wired: bool,
     /// Optional tunnel binary or config is present.
     pub tunnel_present: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_image() -> GuestImage {
+        GuestImage {
+            name: REQUIRED_GUEST_IMAGE.to_string(),
+            version_label: REQUIRED_GUEST_VERSION.to_string(),
+            desktop_label: REQUIRED_DESKTOP_LABEL.to_string(),
+            egress_label: REQUIRED_EGRESS_POLICY.to_string(),
+        }
+    }
+
+    #[test]
+    fn attestation_json_has_stable_storeable_keys() {
+        let report = DoctorReport {
+            protocol: crate::PROTOCOL_VERSION.to_string(),
+            source: ATTESTATION_SOURCE.to_string(),
+            ok: true,
+            eligible: true,
+            class: NodeClass::VmGuest,
+            intent: Intent::Private,
+            checks: vec![DoctorCheck {
+                id: CheckId::Class,
+                status: CheckStatus::Pass,
+                detail: "class=vm-guest".into(),
+            }],
+            image: Some(ImageAttestation::from(&sample_image())),
+            timestamp: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
+        };
+        let value = serde_json::to_value(&report).expect("json");
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["eligible"], true);
+        assert_eq!(value["class"], "vm-guest");
+        assert_eq!(value["source"], "berthos.doctor");
+        assert!(value["checks"].is_array());
+        assert_eq!(
+            value["image"]["labels"]["berthos.guest.version"],
+            REQUIRED_GUEST_VERSION
+        );
+        assert_eq!(
+            value["image"]["labels"]["berthos.desktop"],
+            REQUIRED_DESKTOP_LABEL
+        );
+        assert_eq!(
+            value["image"]["labels"]["berthos.egress.policy"],
+            REQUIRED_EGRESS_POLICY
+        );
+        assert!(value["timestamp"].as_str().unwrap().starts_with("2023-"));
+    }
+
+    #[test]
+    fn laptop_class_serializes_as_kebab_laptop() {
+        let class = NodeClass::Laptop;
+        assert_eq!(serde_json::to_value(class).unwrap(), "laptop");
+    }
 }

@@ -5,13 +5,20 @@
 //! cannot make an ineligible node eligible.
 
 use berthos_protocol::{
-    Chassis, CheckId, CheckStatus, DoctorCheck, DoctorReport, EgressPolicy, Facts, GuestOs, Intent,
-    NodeClass, MIN_FREE_MEM_GIB, MIN_FREE_VCPU, PROTOCOL_VERSION, REQUIRED_DESKTOP_LABEL,
-    REQUIRED_EGRESS_POLICY, REQUIRED_GUEST_IMAGE, REQUIRED_GUEST_VERSION,
+    Chassis, CheckId, CheckStatus, DoctorCheck, DoctorReport, EgressPolicy, Facts, GuestOs,
+    ImageAttestation, Intent, NodeClass, ATTESTATION_SOURCE, MIN_FREE_MEM_GIB, MIN_FREE_VCPU,
+    PROTOCOL_VERSION, REQUIRED_DESKTOP_LABEL, REQUIRED_EGRESS_POLICY, REQUIRED_GUEST_IMAGE,
+    REQUIRED_GUEST_VERSION,
 };
+use time::OffsetDateTime;
 
 /// Evaluate attested + observed facts. Fail closed.
 pub fn evaluate(facts: &Facts) -> DoctorReport {
+    evaluate_at(facts, OffsetDateTime::now_utc())
+}
+
+/// Evaluate with a fixed timestamp (tests / replay).
+pub fn evaluate_at(facts: &Facts, timestamp: OffsetDateTime) -> DoctorReport {
     let checks = vec![
         class_check(facts.class),
         bind_check(facts.bind_is_loopback, &facts.bind_display),
@@ -28,9 +35,14 @@ pub fn evaluate(facts: &Facts) -> DoctorReport {
     let eligible = checks.iter().all(|c| c.status != CheckStatus::Fail);
     DoctorReport {
         protocol: PROTOCOL_VERSION.to_string(),
-        intent: facts.intent,
+        source: ATTESTATION_SOURCE.to_string(),
+        ok: eligible,
         eligible,
+        class: facts.class,
+        intent: facts.intent,
         checks,
+        image: facts.guest_image.as_ref().map(ImageAttestation::from),
+        timestamp,
     }
 }
 
@@ -382,5 +394,29 @@ mod tests {
         let report = evaluate(&facts);
         assert!(!report.eligible);
         assert!(report.failed(CheckId::Availability));
+    }
+
+    #[test]
+    fn attestation_includes_ok_class_image_labels_and_timestamp() {
+        let report = evaluate(&eligible_private_facts());
+        assert!(report.ok);
+        assert_eq!(report.ok, report.eligible);
+        assert_eq!(report.class, NodeClass::VmGuest);
+        assert_eq!(report.source, ATTESTATION_SOURCE);
+        let image = report.image.expect("labeled fixture image");
+        assert_eq!(image.name, REQUIRED_GUEST_IMAGE);
+        assert_eq!(image.labels.guest_version, REQUIRED_GUEST_VERSION);
+        assert_eq!(image.labels.desktop, REQUIRED_DESKTOP_LABEL);
+        assert_eq!(image.labels.egress_policy, REQUIRED_EGRESS_POLICY);
+        assert!(report.timestamp.year() >= 2026);
+    }
+
+    #[test]
+    fn missing_image_attestation_is_null_and_not_ok() {
+        let mut facts = eligible_private_facts();
+        facts.guest_image = None;
+        let report = evaluate(&facts);
+        assert!(!report.ok);
+        assert!(report.image.is_none());
     }
 }
